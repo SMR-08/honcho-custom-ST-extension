@@ -1,0 +1,185 @@
+<div id="honcho_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <div class="flex-container alignitemscenter margin0">
+                <b>Honcho Memory</b>
+            </div>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="honcho_section">
+                <!-- Enable / Disable -->
+                <label class="checkbox_label" for="honcho_enabled">
+                    <input type="checkbox" id="honcho_enabled" />
+                    <span>Enable Honcho Memory</span>
+                </label>
+
+                <!-- Status indicator -->
+                <span id="honcho_status" class="honcho_status not-ready">Not configured</span>
+                <div class="honcho_config_source_row" style="display: flex; align-items: center; gap: 0.5em; margin-top: 0.3em; flex-wrap: nowrap;">
+                    <span class="honcho_config_source" style="font-size: 0.85em; opacity: 0.6; flex: 1; min-width: 0;">
+                        Browser-only SillyTavern extension. Settings are stored in this ST install.
+                    </span>
+                </div>
+
+                <hr />
+
+                <!-- Honcho endpoint -->
+                <label for="honcho_base_url">Honcho URL</label>
+                <div class="flex-container" style="gap: 0.5em; align-items: center;">
+                    <input id="honcho_base_url" type="text" class="text_pole flex1" placeholder="http://127.0.0.1:8000 or https://honcho.example.com" />
+                    <button type="button" id="honcho_test_connection" class="menu_button" title="Run a functional Honcho roundtrip">Test</button>
+                </div>
+                <span id="honcho_base_url_hint" class="honcho_field_hint" style="font-size: 0.8em; opacity: 0.6;">Saved locally. Test creates a temporary workspace/session/peer/message roundtrip. Honcho must allow browser CORS from SillyTavern.</span>
+
+                <!-- API Key -->
+                <label>API Key</label>
+                <div class="flex-container" style="gap: 0.5em; align-items: center;">
+                    <input id="honcho_api_key" type="text" class="text_pole flex1" maxlength="0" readonly placeholder="Click to set key" style="cursor: pointer;" />
+                    <button type="button" id="honcho_api_key_btn" class="menu_button fa-solid fa-key fa-fw" title="Manage API keys" aria-label="Manage API keys"></button>
+                </div>
+
+                <!-- Workspace ID -->
+                <label for="honcho_workspace_id">Workspace ID</label>
+                <input id="honcho_workspace_id" type="text" class="text_pole" placeholder="Enter your Honcho workspace ID" />
+                <span id="honcho_workspace_id_hint" class="honcho_field_hint" style="font-size: 0.8em; opacity: 0.6;">Saved locally to this SillyTavern install.</span>
+
+                <!-- Peer Name (your Honcho peer ID) -->
+                <div id="honcho_peer_name_section" class="honcho_section">
+                    <label for="honcho_peer_name">Your peer name</label>
+                    <input id="honcho_peer_name" type="text" class="text_pole" placeholder="e.g. eri" pattern="^[A-Za-z0-9_-]+$" title="Use only letters, digits, underscore (_), or hyphen (-)." autocomplete="off" spellcheck="false" />
+                    <span id="honcho_peer_name_hint" class="honcho_field_hint" style="font-size: 0.8em; opacity: 0.6;">Applies to new chats. Saved locally to this SillyTavern install.</span>
+                </div>
+
+                <hr />
+
+                <!-- Peer Mode -->
+                <span class="honcho_section_label">Peer Mode</span>
+                <div class="radio_group">
+                    <label>
+                        <input type="radio" name="honcho_peer_mode" value="single" />
+                        <span>Single peer for all personas</span>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_peer_mode" value="per_persona" />
+                        <span>Separate peer per persona</span>
+                    </label>
+                </div>
+
+                <hr />
+
+                <!-- Session Naming -->
+                <span class="honcho_section_label">Session Naming</span>
+                <div class="radio_group">
+                    <label>
+                        <input type="radio" name="honcho_session_naming" value="auto" />
+                        <span>Auto</span>
+                        <i class="fa-solid fa-info-circle" title="charName-YYYY-MM-DD-hash (one session per ST chat)"></i>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_session_naming" value="character" />
+                        <span>Per character</span>
+                        <i class="fa-solid fa-info-circle" title="One persistent session per character (all chats shared)"></i>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_session_naming" value="custom" />
+                        <span>Custom</span>
+                        <i class="fa-solid fa-info-circle" title="Set your own session name"></i>
+                    </label>
+                </div>
+
+                <div id="honcho_custom_session_section" class="honcho_section">
+                    <label for="honcho_custom_session">Session name</label>
+                    <input id="honcho_custom_session" type="text" class="text_pole" placeholder="e.g. my-session-name" />
+                </div>
+
+                <!-- Current session (read-only; derived from Session Naming mode) -->
+                <div id="honcho_active_session_section" class="honcho_section">
+                    <label>Active session</label>
+                    <div style="display: flex; gap: 0.5em; align-items: center;">
+                        <input id="honcho_active_session" type="text" class="text_pole" placeholder="No active session" readonly style="flex: 1;" />
+                        <button type="button" id="honcho_reset_session" class="menu_button" title="Orphan current session and start a new one for this chat" style="white-space: nowrap;">Reset</button>
+                    </div>
+                </div>
+
+                <hr />
+
+                <!-- Context Settings (always visible — base layer for all modes) -->
+                <span class="honcho_section_label">Context</span>
+                <div class="honcho_section">
+                    <label for="honcho_context_tokens">Context token budget</label>
+                    <input id="honcho_context_tokens" type="number" class="text_pole" min="100" max="10000" value="2000" />
+                    <label for="honcho_output_tokens">Honcho output token budget</label>
+                    <input id="honcho_output_tokens" type="number" class="text_pole" min="50" max="4000" value="500" />
+                    <label for="honcho_context_interval">Refresh every N turns</label>
+                    <input id="honcho_context_interval" type="number" class="text_pole" min="1" max="100" value="1" />
+                    <i class="fa-solid fa-info-circle" style="opacity: 0.6; font-size: 0.85em;" title="Always fetched on session start. Cached results served instantly between refreshes (stale-while-revalidate)."></i>
+                    <label class="checkbox_label" for="honcho_context_summary">
+                        <input type="checkbox" id="honcho_context_summary" />
+                        <span>Include session summary</span>
+                    </label>
+                </div>
+
+                <hr />
+
+                <!-- Enrichment Mode -->
+                <span class="honcho_section_label">Enrichment Mode</span>
+                <div class="radio_group">
+                    <label>
+                        <input type="radio" name="honcho_context_mode" value="context" />
+                        <span>Context only</span>
+                        <i class="fa-solid fa-info-circle" title="Peer representation and session summary only."></i>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_context_mode" value="reasoning" />
+                        <span>Reasoning</span>
+                        <i class="fa-solid fa-info-circle" title="Context + dialectic reasoning queries on an interval."></i>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_context_mode" value="tool_call" />
+                        <span>Tool call</span>
+                        <i class="fa-solid fa-info-circle" title="Context + function tools the LLM can call on demand."></i>
+                    </label>
+                </div>
+
+                <!-- Reasoning settings (shown when reasoning mode) -->
+                <div id="honcho_prefetch_section" class="honcho_section">
+                    <label for="honcho_prefetch_queries">Reasoning queries (one per line)</label>
+                    <textarea id="honcho_prefetch_queries" class="text_pole textarea_compact" rows="3" placeholder="Use {{message}} for the user's last message&#10;e.g. Based on: &quot;{{message}}&quot;, what's relevant about the user?"></textarea>
+                    <label for="honcho_prefetch_interval">Reason every N turns</label>
+                    <input id="honcho_prefetch_interval" type="number" class="text_pole" min="1" max="100" value="8" />
+                    <i class="fa-solid fa-info-circle" style="opacity: 0.6; font-size: 0.85em;" title="Always runs on session start. Cached results served instantly between refreshes."></i>
+                </div>
+
+                <hr />
+
+                <!-- Injection Position -->
+                <span class="honcho_section_label">Injection Position</span>
+                <div class="radio_group">
+                    <label>
+                        <input type="radio" name="honcho_injection_position" value="0" />
+                        <span>After Main Prompt</span>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_injection_position" value="2" />
+                        <span>Before Main Prompt</span>
+                    </label>
+                    <label>
+                        <input type="radio" name="honcho_injection_position" value="1" />
+                        <span>In-chat @ Depth</span>
+                    </label>
+                </div>
+
+                <div id="honcho_depth_section" class="honcho_section">
+                    <label for="honcho_injection_depth">Injection Depth</label>
+                    <input id="honcho_injection_depth" type="number" class="text_pole" min="0" max="9999" value="4" />
+                </div>
+
+                <!-- Prompt Template -->
+                <label for="honcho_prompt_template">Prompt Template</label>
+                <textarea id="honcho_prompt_template" class="text_pole textarea_compact" rows="3" placeholder="Use {{text}} as placeholder for Honcho's response">[Honcho Memory]
+{{text}}</textarea>
+            </div>
+        </div>
+    </div>
+</div>
