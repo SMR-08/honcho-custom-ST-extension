@@ -15,7 +15,6 @@ import {
 import {
     extension_settings,
     getContext,
-    renderExtensionTemplateAsync,
     saveMetadataDebounced,
 } from '../../../extensions.js';
 import { selected_group, groups } from '../../../group-chats.js';
@@ -23,7 +22,6 @@ import { oai_settings } from '../../../openai.js';
 import { callGenericPopup, POPUP_TYPE, POPUP_RESULT, Popup } from '../../../popup.js';
 
 const MODULE_NAME = 'honcho';
-const EXTENSION_TEMPLATE_PATH = 'third-party/sillytavern-honcho-localfirst';
 const MESSAGE_CHAR_LIMIT = 24000;
 const QUERY_CHAR_LIMIT = 10000;
 const MAX_LATE_CACHE = 50;
@@ -904,11 +902,20 @@ function bindSettingsListeners() {
     $('#honcho_api_key, #honcho_api_key_btn').on('click', openApiKeyDialog);
 }
 
+async function loadSettingsHtml() {
+    const settingsUrl = new URL('./settings.html', import.meta.url);
+    const response = await fetch(settingsUrl);
+    if (!response.ok) {
+        throw new Error(`Error loading ${settingsUrl.pathname}: ${response.status} ${response.statusText}`);
+    }
+    return response.text();
+}
+
 jQuery(async () => {
     if (!extension_settings.honcho) extension_settings.honcho = {};
     extension_settings.honcho = Object.assign({}, defaultSettings, extension_settings.honcho);
 
-    const settingsHtml = await renderExtensionTemplateAsync(EXTENSION_TEMPLATE_PATH, 'settings');
+    const settingsHtml = await loadSettingsHtml();
     $('#extensions_settings2').append(settingsHtml);
 
     loadSettingsUI();
