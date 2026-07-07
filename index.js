@@ -569,48 +569,62 @@ async function reconcileHonchoMessages(reason = 'sync') {
     try {
         const messageMap = getSyncedMessageMap(honchoMeta);
         const currentEntries = buildCurrentSyncEntries(honchoMeta);
-        const currentKeys = new Set(currentEntries.map(entry => entry.key));
+        const currentByKey = new Map(currentEntries.map(entry => [entry.key, entry]));
         let changed = false;
+        let firstChangedIndex = null;
 
         for (const [key, record] of Object.entries(messageMap)) {
-            if (!currentKeys.has(key) && record && !record.deleted) {
-                const tombstoneEntry = {
-                    key,
-                    index: Number(key),
-                    hash: record.hash,
-                    peerId: record.peerId,
-                    role: record.role,
-                    name: record.name || record.peerId,
-                };
-                await markHonchoMessageIds(honchoMeta.sessionId, record.honchoMessageIds, buildMessageMetadata(tombstoneEntry, record.version || 1, {
-                    current: false,
-                    deleted: true,
-                }));
-                record.deleted = true;
-                record.updatedAt = new Date().toISOString();
-                changed = true;
+            if (record?.deleted) continue;
+            const index = Number(key);
+            const current = currentByKey.get(key);
+            const changedAtKey = !current || record.hash !== current.hash || record.peerId !== current.peerId;
+            if (changedAtKey && (firstChangedIndex === null || index < firstChangedIndex)) {
+                firstChangedIndex = index;
             }
         }
 
         for (const entry of currentEntries) {
             const previous = messageMap[entry.key];
-            if (previous && !previous.deleted && previous.hash === entry.hash && previous.peerId === entry.peerId) continue;
-
-            if (previous?.honchoMessageIds?.length && !previous.deleted) {
-                const previousEntry = {
-                    key: entry.key,
-                    index: entry.index,
-                    hash: previous.hash,
-                    peerId: previous.peerId,
-                    role: previous.role,
-                    name: previous.name || previous.peerId,
-                };
-                await markHonchoMessageIds(honchoMeta.sessionId, previous.honchoMessageIds, buildMessageMetadata(previousEntry, previous.version || 1, {
-                    current: false,
-                    superseded: true,
-                }));
+            if ((!previous || previous.deleted) && (firstChangedIndex === null || entry.index < firstChangedIndex)) {
+                firstChangedIndex = entry.index;
             }
+        }
 
+        if (firstChangedIndex === null) {
+            return;
+        }
+
+        const staleKeys = Object.keys(messageMap)
+            .map(key => Number(key))
+            .filter(index => Number.isFinite(index) && index >= firstChangedIndex)
+            .sort((a, b) => a - b)
+            .map(index => String(index));
+
+        for (const key of staleKeys) {
+            const record = messageMap[key];
+            if (!record || record.deleted) continue;
+            const staleEntry = {
+                key,
+                index: Number(key),
+                hash: record.hash,
+                peerId: record.peerId,
+                role: record.role,
+                name: record.name || record.peerId,
+            };
+            await markHonchoMessageIds(honchoMeta.sessionId, record.honchoMessageIds, buildMessageMetadata(staleEntry, record.version || 1, {
+                current: false,
+                superseded: currentByKey.has(key),
+                deleted: !currentByKey.has(key),
+            }));
+            record.deleted = !currentByKey.has(key);
+            record.superseded = currentByKey.has(key);
+            record.updatedAt = new Date().toISOString();
+            changed = true;
+        }
+
+        const entriesToRebuild = currentEntries.filter(entry => entry.index >= firstChangedIndex);
+        for (const entry of entriesToRebuild) {
+            const previous = messageMap[entry.key];
             const stored = await storeSyncedMessage(honchoMeta, entry, previous);
             if (stored) {
                 messageMap[entry.key] = stored;
@@ -621,6 +635,7 @@ async function reconcileHonchoMessages(reason = 'sync') {
         if (changed) {
             honchoMeta.syncSchemaVersion = SYNC_SCHEMA_VERSION;
             honchoMeta.lastSyncReason = reason;
+            honchoMeta.lastRebuiltFromIndex = firstChangedIndex;
             honchoMeta.lastSyncedAt = new Date().toISOString();
             updateChatMetadata({ honcho: honchoMeta });
             saveMetadataDebounced();

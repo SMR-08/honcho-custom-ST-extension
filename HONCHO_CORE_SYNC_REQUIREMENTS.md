@@ -11,6 +11,8 @@ SillyTavern permite operaciones normales de edición de chat:
 
 La extensión `honcho-custom-ST-extension` ya implementa una mitigación autocontenida: toma el chat actual de SillyTavern como fuente de verdad, guarda metadatos de sincronización en cada mensaje Honcho y marca mensajes antiguos como `deleted` o `superseded` mediante metadata cuando ST cambia.
 
+Para preservar cronología con una API append-only, la extensión hace rebuild parcial desde el primer índice cambiado. Ejemplo: si el chat era `A -> B -> C -> D` y el usuario edita `B`, la extensión marca `B,C,D` antiguos como no vigentes y reinserta `B editado,C,D`. El historial vivo queda `A -> B editado -> C -> D`.
+
 Esto funciona sin tocar Honcho para contexto limpio en la extensión, pero no elimina físicamente contenido viejo de Honcho ni recalcula derivados. Para sincronización perfecta hace falta ampliar Honcho core.
 
 ## Problema actual en Honcho
@@ -530,3 +532,40 @@ DELETE borra real/lógico
 ```
 
 Hasta entonces, la extensión usa tombstones por metadata y filtra contexto propio.
+
+## Workaround actual de la extensión
+
+Mientras Honcho no tenga update/delete real, la extensión usa este algoritmo:
+
+1. Construye snapshot actual del chat de SillyTavern.
+2. Compara cada índice con `chat_metadata.honcho.messageMap`.
+3. Encuentra el primer índice cambiado.
+4. Mantiene mensajes Honcho anteriores a ese índice.
+5. Marca como `deleted` o `superseded` todos los mensajes Honcho desde ese índice hacia adelante.
+6. Reinserta todos los mensajes actuales desde ese índice hasta el final.
+7. Al construir contexto, sólo usa mensajes con `metadata.honcho_st_sync.current=true` y sin `deleted/superseded`.
+
+Esto evita el fallo cronológico típico de append-only:
+
+```text
+Incorrecto:
+A -> B -> C -> D
+editar B
+A -> C -> D -> B_editado
+```
+
+La extensión produce:
+
+```text
+Correcto:
+A -> B_editado -> C -> D
+```
+
+Coste del workaround:
+
+- más mensajes físicos en Honcho,
+- tombstones por metadata,
+- rebuild parcial caro si se edita un mensaje muy antiguo,
+- no limpia embeddings/representaciones ya derivadas.
+
+Cuando Honcho implemente `PATCH content`, `DELETE` y rebuild derivado, la extensión deberá migrar a edición/borrado real y dejar de reinsertar colas del chat.

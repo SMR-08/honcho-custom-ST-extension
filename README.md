@@ -94,11 +94,14 @@ La extensión usa el chat actual de SillyTavern como fuente de verdad:
 
 - mantiene un mapa `mensaje ST -> mensaje(s) Honcho` en `chat_metadata.honcho.messageMap`,
 - detecta mensajes editados o borrados con eventos de SillyTavern,
-- marca versiones antiguas en Honcho con metadata `deleted` o `superseded`,
-- crea una versión nueva cuando el contenido cambia,
+- localiza el primer índice cambiado,
+- marca como `deleted` o `superseded` las versiones antiguas desde ese índice hacia adelante,
+- reinserta desde ese índice hasta el final del chat para preservar orden cronológico,
 - construye contexto limpio filtrando mensajes marcados como borrados/sustituidos.
 
 Esto evita que el prompt inyectado por la extensión use mensajes borrados o editados.
+
+Ejemplo: si el chat era `A -> B -> C -> D` y editas `B`, la extensión marca como antiguas `B,C,D` y reinserta `B editado,C,D`. El historial vivo queda `A -> B editado -> C -> D`, no `A -> C -> D -> B editado`.
 
 Limitación: si activas embeddings/deriver/representations en Honcho, un mensaje viejo ya derivado puede seguir influyendo internamente hasta que Honcho core soporte update/delete/rebuild real. Ver `HONCHO_CORE_SYNC_REQUIREMENTS.md`.
 
