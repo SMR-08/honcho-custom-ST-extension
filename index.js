@@ -25,6 +25,7 @@ const MODULE_NAME = 'honcho';
 const MESSAGE_CHAR_LIMIT = 24000;
 const QUERY_CHAR_LIMIT = 10000;
 const MAX_LATE_CACHE = 50;
+const SYNC_SCHEMA_VERSION = 1;
 
 const defaultSettings = {
     enabled: false,
@@ -56,6 +57,8 @@ let contextRefreshInFlight = false;
 let turnsSinceLastContextRefresh = Infinity;
 let cachedReasoningText = null;
 let reasoningRefreshInFlight = false;
+let syncInProgress = false;
+let pendingSyncReason = null;
 const lateResultCache = new Map();
 const pendingBackgroundQueries = new Map();
 const activeAbortControllers = new Set();
@@ -142,6 +145,32 @@ function chunkText(text, limit) {
     }
     if (rest) chunks.push(rest);
     return chunks.filter(Boolean);
+}
+
+function hashText(value) {
+    const text = String(value || '');
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index++) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+}
+
+function normalizeMessageContent(value) {
+    return String(value || '').replace(/\r\n/g, '\n').trim();
+}
+
+function getHonchoMetadata(messageMetadata) {
+    return messageMetadata?.honcho_st_sync || {};
+}
+
+function isLiveHonchoMessage(message) {
+    const sync = getHonchoMetadata(message?.metadata || message?.h_metadata);
+    return sync.schema_version === SYNC_SCHEMA_VERSION
+        && sync.deleted !== true
+        && sync.superseded !== true
+        && sync.current !== false;
 }
 
 async function honchoRequest(method, path, { body = null, query = null, signal = null } = {}) {
@@ -271,8 +300,21 @@ async function callHonchoOperation(endpoint, body, signal) {
             for (const message of body.messages || []) {
                 if (!message.peerId || !message.content) continue;
                 const chunks = chunkText(message.content, MESSAGE_CHAR_LIMIT);
-                for (const chunk of chunks) {
-                    messages.push({ peer_id: message.peerId, content: chunk });
+                for (const [chunkIndex, chunk] of chunks.entries()) {
+                    messages.push({
+                        peer_id: message.peerId,
+                        content: chunk,
+                        ...(message.metadata ? {
+                            metadata: {
+                                ...message.metadata,
+                                honcho_st_sync: {
+                                    ...message.metadata.honcho_st_sync,
+                                    chunk_index: chunkIndex,
+                                    chunk_count: chunks.length,
+                                },
+                            },
+                        } : {}),
+                    });
                 }
             }
             if (!messages.length) throw new Error('No valid messages provided');
@@ -280,7 +322,26 @@ async function callHonchoOperation(endpoint, body, signal) {
                 body: { messages },
                 signal,
             });
-            return { count: Array.isArray(stored) ? stored.length : messages.length };
+            return {
+                count: Array.isArray(stored) ? stored.length : messages.length,
+                messages: Array.isArray(stored) ? stored : [],
+                ids: Array.isArray(stored) ? stored.map(message => message.id || message.public_id).filter(Boolean) : [],
+            };
+        }
+        case '/session/message-metadata': {
+            const updated = await honchoRequest('PUT', `/v3/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(body.sessionId)}/messages/${encodeURIComponent(body.messageId)}`, {
+                body: { metadata: body.metadata || {} },
+                signal,
+            });
+            return { ok: true, message: updated };
+        }
+        case '/session/list-messages': {
+            const listed = await honchoRequest('POST', `/v3/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(body.sessionId)}/messages/list`, {
+                body: {},
+                query: { page: body.page || 1, size: body.size || 100, reverse: body.reverse === true },
+                signal,
+            });
+            return listed;
         }
         case '/context': {
             const context = await honchoRequest('GET', `/v3/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(body.sessionId)}/context`, {
@@ -359,6 +420,25 @@ function formatSessionContext(context) {
     return parts.join('\n\n') || null;
 }
 
+function formatLiveMessageContext(messages) {
+    const liveMessages = (messages || []).filter(isLiveHonchoMessage);
+    if (!liveMessages.length) return null;
+    return liveMessages
+        .slice(-24)
+        .map(message => `${message.peer_id || message.peer_name || 'peer'}: ${message.content}`)
+        .join('\n');
+}
+
+async function fetchCleanSessionContext(sessionId) {
+    const result = await honchoFetch('/session/list-messages', {
+        sessionId,
+        page: 1,
+        size: 100,
+        reverse: false,
+    });
+    return formatLiveMessageContext(result?.items || []);
+}
+
 function getUserPeerId() {
     const context = getContext();
     const explicit = settings().peerName || context.name1 || 'default-user';
@@ -391,6 +471,171 @@ function getGroupCharPeerIds() {
 
 function getPeerIdForMessage(message) {
     return sanitizeId(message?.name || getCharName());
+}
+
+function getPeerIdForChatMessage(message, index, honchoMeta) {
+    if (message?.is_user) return honchoMeta.userPeerId;
+    if (message?.is_system) return null;
+    return getPeerIdForMessage(message) || honchoMeta.charPeerId;
+}
+
+function getSyncedMessageMap(honchoMeta) {
+    if (!honchoMeta.messageMap || typeof honchoMeta.messageMap !== 'object') {
+        honchoMeta.messageMap = {};
+    }
+    return honchoMeta.messageMap;
+}
+
+function buildCurrentSyncEntries(honchoMeta) {
+    const entries = [];
+    for (let index = 0; index < chat.length; index++) {
+        const message = chat[index];
+        if (!message || message.is_system) continue;
+        const content = normalizeMessageContent(message.mes);
+        if (!content) continue;
+        const peerId = getPeerIdForChatMessage(message, index, honchoMeta);
+        if (!peerId) continue;
+        entries.push({
+            key: String(index),
+            index,
+            peerId,
+            role: message.is_user ? 'user' : 'assistant',
+            content,
+            hash: hashText(`${peerId}\n${content}`),
+            name: message.name || (message.is_user ? getContext().name1 : getCharName()),
+        });
+    }
+    return entries;
+}
+
+function buildMessageMetadata(entry, version, status = {}) {
+    return {
+        honcho_st_sync: {
+            schema_version: SYNC_SCHEMA_VERSION,
+            st_message_index: entry.index,
+            st_message_key: entry.key,
+            st_message_hash: entry.hash,
+            st_message_version: version,
+            st_peer_id: entry.peerId,
+            st_role: entry.role,
+            st_name: entry.name,
+            current: status.current !== false,
+            deleted: status.deleted === true,
+            superseded: status.superseded === true,
+            superseded_by: status.supersededBy || null,
+            updated_at: new Date().toISOString(),
+        },
+    };
+}
+
+async function markHonchoMessageIds(sessionId, messageIds, metadata) {
+    for (const messageId of messageIds || []) {
+        await honchoFetch('/session/message-metadata', { sessionId, messageId, metadata });
+    }
+}
+
+async function storeSyncedMessage(honchoMeta, entry, previousRecord = null) {
+    const version = (previousRecord?.version || 0) + 1;
+    const metadata = buildMessageMetadata(entry, version);
+    const result = await honchoFetch('/session/messages', {
+        sessionId: honchoMeta.sessionId,
+        messages: [{ peerId: entry.peerId, content: entry.content, metadata }],
+    });
+    if (!result?.ids?.length) return null;
+    return {
+        honchoMessageIds: result.ids,
+        hash: entry.hash,
+        peerId: entry.peerId,
+        role: entry.role,
+        name: entry.name,
+        version,
+        deleted: false,
+        contentLength: entry.content.length,
+        updatedAt: new Date().toISOString(),
+    };
+}
+
+async function reconcileHonchoMessages(reason = 'sync') {
+    if (!isReady()) return;
+    const honchoMeta = chat_metadata?.honcho;
+    if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return;
+
+    if (syncInProgress) {
+        pendingSyncReason = reason;
+        return;
+    }
+
+    syncInProgress = true;
+    try {
+        const messageMap = getSyncedMessageMap(honchoMeta);
+        const currentEntries = buildCurrentSyncEntries(honchoMeta);
+        const currentKeys = new Set(currentEntries.map(entry => entry.key));
+        let changed = false;
+
+        for (const [key, record] of Object.entries(messageMap)) {
+            if (!currentKeys.has(key) && record && !record.deleted) {
+                const tombstoneEntry = {
+                    key,
+                    index: Number(key),
+                    hash: record.hash,
+                    peerId: record.peerId,
+                    role: record.role,
+                    name: record.name || record.peerId,
+                };
+                await markHonchoMessageIds(honchoMeta.sessionId, record.honchoMessageIds, buildMessageMetadata(tombstoneEntry, record.version || 1, {
+                    current: false,
+                    deleted: true,
+                }));
+                record.deleted = true;
+                record.updatedAt = new Date().toISOString();
+                changed = true;
+            }
+        }
+
+        for (const entry of currentEntries) {
+            const previous = messageMap[entry.key];
+            if (previous && !previous.deleted && previous.hash === entry.hash && previous.peerId === entry.peerId) continue;
+
+            if (previous?.honchoMessageIds?.length && !previous.deleted) {
+                const previousEntry = {
+                    key: entry.key,
+                    index: entry.index,
+                    hash: previous.hash,
+                    peerId: previous.peerId,
+                    role: previous.role,
+                    name: previous.name || previous.peerId,
+                };
+                await markHonchoMessageIds(honchoMeta.sessionId, previous.honchoMessageIds, buildMessageMetadata(previousEntry, previous.version || 1, {
+                    current: false,
+                    superseded: true,
+                }));
+            }
+
+            const stored = await storeSyncedMessage(honchoMeta, entry, previous);
+            if (stored) {
+                messageMap[entry.key] = stored;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            honchoMeta.syncSchemaVersion = SYNC_SCHEMA_VERSION;
+            honchoMeta.lastSyncReason = reason;
+            honchoMeta.lastSyncedAt = new Date().toISOString();
+            updateChatMetadata({ honcho: honchoMeta });
+            saveMetadataDebounced();
+            resetCaches();
+        }
+    } catch (err) {
+        console.warn(`[Honcho] Reconcile failed (${reason}):`, err.message);
+    } finally {
+        syncInProgress = false;
+        if (pendingSyncReason) {
+            const nextReason = pendingSyncReason;
+            pendingSyncReason = null;
+            reconcileHonchoMessages(nextReason);
+        }
+    }
 }
 
 function getSessionId(rawChatId) {
@@ -436,9 +681,20 @@ async function onChatChanged() {
         });
 
         if (result) {
-            updateChatMetadata({ honcho: { sessionId: chatId, userPeerId, charPeerId, charPeerIds: groupCharPeerIds } });
+            updateChatMetadata({
+                honcho: {
+                    ...existingMeta,
+                    sessionId: chatId,
+                    userPeerId,
+                    charPeerId,
+                    charPeerIds: groupCharPeerIds,
+                    messageMap: existingMeta?.messageMap || {},
+                    syncSchemaVersion: SYNC_SCHEMA_VERSION,
+                },
+            });
             saveMetadataDebounced();
             updateActiveSessionDisplay();
+            await reconcileHonchoMessages('chat_changed');
         } else {
             console.warn('[Honcho] Session setup failed');
         }
@@ -459,12 +715,11 @@ async function fetchReasoningQueries(honchoMeta, lastUserMessage) {
         if (!isReady()) break;
         const trimmed = query.trim().replace(/\{\{message\}\}/gi, lastUserMessage);
         if (!trimmed) continue;
-        const result = await honchoFetchRawTracked('/chat', {
-            peerId: honchoMeta.userPeerId,
-            query: trimmed,
-            sessionId: honchoMeta.sessionId,
-        });
-        if (result?.response) results.push(clampHonchoOutput(result.response));
+        const result = await honchoFetchRawTracked('/search', { sessionId: honchoMeta.sessionId, query: trimmed, limit: 8 });
+        const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+        if (liveResults.length) {
+            results.push(liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n'));
+        }
     }
     return results.length ? results.join('\n\n') : null;
 }
@@ -473,6 +728,8 @@ async function onGeneration() {
     if (!isReady()) return;
     const honchoMeta = chat_metadata?.honcho;
     if (!honchoMeta?.sessionId) return;
+
+    await reconcileHonchoMessages('before_generation');
 
     const currentIndex = chat.length - 1;
     if (currentIndex >= 0 && currentIndex === lastGenerationChatIndex) return;
@@ -488,25 +745,17 @@ async function onGeneration() {
 
     const parts = [];
     try {
-        const contextBody = {
-            sessionId: honchoMeta.sessionId,
-            userPeerId: honchoMeta.userPeerId,
-            charPeerId: honchoMeta.charPeerId,
-            tokens: settings().contextTokens,
-            summary: settings().contextSummary,
-        };
-
         turnsSinceLastContextRefresh++;
         if (cachedContextText === null) {
-            const contextResult = await honchoFetch('/context', contextBody);
+            const contextResult = await fetchCleanSessionContext(honchoMeta.sessionId);
             if (!isReady()) return;
-            if (contextResult?.context) cachedContextText = contextResult.context;
+            if (contextResult) cachedContextText = contextResult;
             turnsSinceLastContextRefresh = 0;
         } else if (turnsSinceLastContextRefresh >= (settings().contextInterval || 1) && !contextRefreshInFlight) {
             turnsSinceLastContextRefresh = 0;
             contextRefreshInFlight = true;
-            honchoFetchRawTracked('/context', contextBody)
-                .then(result => { if (isReady() && result?.context) cachedContextText = result.context; })
+            fetchCleanSessionContext(honchoMeta.sessionId)
+                .then(result => { if (isReady() && result) cachedContextText = result; })
                 .finally(() => { contextRefreshInFlight = false; });
         }
         if (cachedContextText) parts.push(cachedContextText);
@@ -547,12 +796,7 @@ async function onMessageSent(messageIndex) {
     if (!isReady()) return;
     const honchoMeta = chat_metadata?.honcho;
     if (!honchoMeta?.sessionId) return;
-    const message = chat[messageIndex];
-    if (!message || !message.is_user) return;
-    await honchoFetch('/session/messages', {
-        sessionId: honchoMeta.sessionId,
-        messages: [{ peerId: honchoMeta.userPeerId, content: message.mes }],
-    });
+    await reconcileHonchoMessages(`message_sent:${messageIndex}`);
 }
 
 async function onCharResponse(messageIndex) {
@@ -578,10 +822,15 @@ async function onCharResponse(messageIndex) {
         }
     }
 
-    await honchoFetch('/session/messages', {
-        sessionId: honchoMeta.sessionId,
-        messages: [{ peerId, content: message.mes }],
-    });
+    await reconcileHonchoMessages(`character_message_rendered:${messageIndex}`);
+}
+
+async function onMessageEdited(messageIndex) {
+    await reconcileHonchoMessages(`message_edited:${messageIndex ?? 'unknown'}`);
+}
+
+async function onMessageDeleted(messageIndex) {
+    await reconcileHonchoMessages(`message_deleted:${messageIndex ?? 'unknown'}`);
 }
 
 function registerHonchoTools() {
@@ -602,9 +851,10 @@ function registerHonchoTools() {
             if (!args?.query) return 'No query provided.';
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return 'Honcho session not initialized for this chat.';
-            const cacheKey = `tool:${honchoMeta.sessionId}:${args.query.slice(0, 40)}`;
-            const result = await honchoFetch('/chat', { peerId: honchoMeta.userPeerId, query: args.query, sessionId: honchoMeta.sessionId }, 30000, cacheKey);
-            return result?.response ? clampHonchoOutput(result.response) : 'No information available.';
+            const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 8 }, 30000, `tool:${honchoMeta.sessionId}:${args.query.slice(0, 40)}`);
+            const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+            if (!liveResults.length) return 'No information available.';
+            return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
         },
         formatMessage: () => 'Querying Honcho memory...',
         shouldRegister,
@@ -648,8 +898,9 @@ function registerHonchoTools() {
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId) return 'Honcho session not initialized for this chat.';
             const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 5 });
-            if (!result?.results?.length) return 'No matching messages found.';
-            return result.results.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
+            const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+            if (!liveResults.length) return 'No matching messages found.';
+            return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
         },
         formatMessage: () => 'Searching conversation history...',
         shouldRegister,
@@ -925,6 +1176,8 @@ jQuery(async () => {
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.GENERATION_AFTER_COMMANDS, onGeneration);
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+    if (event_types.MESSAGE_EDITED) eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
+    if (event_types.MESSAGE_DELETED) eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
     eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onCharResponse);
 
     console.log('[Honcho] Browser-only extension loaded');

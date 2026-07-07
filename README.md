@@ -22,6 +22,7 @@ index.js
 settings.html
 style.css
 README.md
+HONCHO_CORE_SYNC_REQUIREMENTS.md
 ```
 
 ## Requisitos
@@ -84,6 +85,22 @@ Registra herramientas para modelos/backends compatibles con function calling:
 - Peers por persona/personaje.
 - Sesión por chat/personaje/custom según configuración.
 - Conclusiones explícitas guardadas por tool call.
+
+## Sincronización con edición, borrado y regeneración
+
+SillyTavern permite editar, borrar y regenerar mensajes. Honcho API actual no borra ni edita contenido de mensajes por API pública; sólo permite actualizar metadata.
+
+La extensión usa el chat actual de SillyTavern como fuente de verdad:
+
+- mantiene un mapa `mensaje ST -> mensaje(s) Honcho` en `chat_metadata.honcho.messageMap`,
+- detecta mensajes editados o borrados con eventos de SillyTavern,
+- marca versiones antiguas en Honcho con metadata `deleted` o `superseded`,
+- crea una versión nueva cuando el contenido cambia,
+- construye contexto limpio filtrando mensajes marcados como borrados/sustituidos.
+
+Esto evita que el prompt inyectado por la extensión use mensajes borrados o editados.
+
+Limitación: si activas embeddings/deriver/representations en Honcho, un mensaje viejo ya derivado puede seguir influyendo internamente hasta que Honcho core soporte update/delete/rebuild real. Ver `HONCHO_CORE_SYNC_REQUIREMENTS.md`.
 
 ## Seguridad
 
