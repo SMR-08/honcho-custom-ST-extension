@@ -173,6 +173,41 @@ function isLiveHonchoMessage(message) {
         && sync.current !== false;
 }
 
+function getSyncNumber(sync, key, fallback = 0) {
+    const value = Number(sync?.[key]);
+    return Number.isFinite(value) ? value : fallback;
+}
+
+function compareHonchoMessagesBySTOrder(left, right) {
+    const leftSync = getHonchoMetadata(left?.metadata || left?.h_metadata);
+    const rightSync = getHonchoMetadata(right?.metadata || right?.h_metadata);
+    const indexDiff = getSyncNumber(leftSync, 'st_message_index') - getSyncNumber(rightSync, 'st_message_index');
+    if (indexDiff !== 0) return indexDiff;
+    const chunkDiff = getSyncNumber(leftSync, 'chunk_index') - getSyncNumber(rightSync, 'chunk_index');
+    if (chunkDiff !== 0) return chunkDiff;
+    return String(left?.created_at || '').localeCompare(String(right?.created_at || ''));
+}
+
+function selectCurrentHonchoMessages(messages) {
+    const selected = new Map();
+    for (const message of messages || []) {
+        if (!isLiveHonchoMessage(message)) continue;
+        const sync = getHonchoMetadata(message?.metadata || message?.h_metadata);
+        const key = `${sync.st_message_key ?? sync.st_message_index}:${getSyncNumber(sync, 'chunk_index')}`;
+        const current = selected.get(key);
+        if (!current) {
+            selected.set(key, message);
+            continue;
+        }
+        const currentSync = getHonchoMetadata(current?.metadata || current?.h_metadata);
+        const versionDiff = getSyncNumber(sync, 'st_message_version') - getSyncNumber(currentSync, 'st_message_version');
+        if (versionDiff > 0 || (versionDiff === 0 && String(message.created_at || '') > String(current.created_at || ''))) {
+            selected.set(key, message);
+        }
+    }
+    return Array.from(selected.values()).sort(compareHonchoMessagesBySTOrder);
+}
+
 async function honchoRequest(method, path, { body = null, query = null, signal = null } = {}) {
     const baseUrl = getHonchoBaseUrl();
     if (!baseUrl) throw new Error('Honcho URL is required');
@@ -421,7 +456,7 @@ function formatSessionContext(context) {
 }
 
 function formatLiveMessageContext(messages) {
-    const liveMessages = (messages || []).filter(isLiveHonchoMessage);
+    const liveMessages = selectCurrentHonchoMessages(messages);
     if (!liveMessages.length) return null;
     return liveMessages
         .slice(-24)
@@ -731,7 +766,7 @@ async function fetchReasoningQueries(honchoMeta, lastUserMessage) {
         const trimmed = query.trim().replace(/\{\{message\}\}/gi, lastUserMessage);
         if (!trimmed) continue;
         const result = await honchoFetchRawTracked('/search', { sessionId: honchoMeta.sessionId, query: trimmed, limit: 8 });
-        const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+        const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
         if (liveResults.length) {
             results.push(liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n'));
         }
@@ -867,7 +902,7 @@ function registerHonchoTools() {
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return 'Honcho session not initialized for this chat.';
             const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 8 }, 30000, `tool:${honchoMeta.sessionId}:${args.query.slice(0, 40)}`);
-            const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+            const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
             if (!liveResults.length) return 'No information available.';
             return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
         },
@@ -913,7 +948,7 @@ function registerHonchoTools() {
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId) return 'Honcho session not initialized for this chat.';
             const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 5 });
-            const liveResults = (result?.results || []).filter(item => typeof item === 'string' || isLiveHonchoMessage(item));
+            const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
             if (!liveResults.length) return 'No matching messages found.';
             return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
         },

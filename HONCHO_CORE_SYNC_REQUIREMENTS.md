@@ -544,6 +544,7 @@ Mientras Honcho no tenga update/delete real, la extensión usa este algoritmo:
 5. Marca como `deleted` o `superseded` todos los mensajes Honcho desde ese índice hacia adelante.
 6. Reinserta todos los mensajes actuales desde ese índice hasta el final.
 7. Al construir contexto, sólo usa mensajes con `metadata.honcho_st_sync.current=true` y sin `deleted/superseded`.
+8. Ordena los mensajes vivos por `st_message_index` y `chunk_index`, no por el orden físico devuelto por Honcho.
 
 Esto evita el fallo cronológico típico de append-only:
 

@@ -97,7 +97,8 @@ La extensión usa el chat actual de SillyTavern como fuente de verdad:
 - localiza el primer índice cambiado,
 - marca como `deleted` o `superseded` las versiones antiguas desde ese índice hacia adelante,
 - reinserta desde ese índice hasta el final del chat para preservar orden cronológico,
-- construye contexto limpio filtrando mensajes marcados como borrados/sustituidos.
+- construye contexto limpio filtrando mensajes marcados como borrados/sustituidos,
+- ordena el contexto vivo por `st_message_index` y `chunk_index`, no por orden devuelto por Honcho.
 
 Esto evita que el prompt inyectado por la extensión use mensajes borrados o editados.
 
