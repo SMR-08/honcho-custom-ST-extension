@@ -508,9 +508,49 @@ function getPeerIdForMessage(message) {
     return sanitizeId(message?.name || getCharName());
 }
 
+/**
+ * SillyTavern "Hide" marks roleplay messages with is_system=true so they leave the
+ * model context budget. That flag must NOT drop them from Honcho: large RPs hide old
+ * turns to save prompt space while long-term memory still needs those turns.
+ *
+ * Real ST system/UI messages set extra.type (help, welcome, slash help, etc.) and are
+ * still excluded. Narrator posts are roleplay content and stay eligible.
+ */
+function isNonRoleplaySystemMessage(message) {
+    if (!message) return true;
+    if (message.is_user) return false;
+
+    if (Array.isArray(message.extra?.tool_invocations) && message.extra.tool_invocations.length > 0) {
+        return true;
+    }
+
+    const type = message.extra?.type;
+    if (!type) {
+        // Hidden user/character messages only flip is_system; keep them for Honcho.
+        return false;
+    }
+
+    if (type === 'narrator') return false;
+
+    return [
+        'help',
+        'welcome',
+        'empty',
+        'generic',
+        'comment',
+        'slash_commands',
+        'formatting',
+        'hotkeys',
+        'macros',
+        'welcome_prompt',
+        'assistant_note',
+        'assistant_message',
+    ].includes(type);
+}
+
 function getPeerIdForChatMessage(message, index, honchoMeta) {
     if (message?.is_user) return honchoMeta.userPeerId;
-    if (message?.is_system) return null;
+    if (isNonRoleplaySystemMessage(message)) return null;
     return getPeerIdForMessage(message) || honchoMeta.charPeerId;
 }
 
@@ -525,7 +565,8 @@ function buildCurrentSyncEntries(honchoMeta) {
     const entries = [];
     for (let index = 0; index < chat.length; index++) {
         const message = chat[index];
-        if (!message || message.is_system) continue;
+        // Ignore Hide/is_system for roleplay turns; only skip real ST system/UI noise.
+        if (!message || isNonRoleplaySystemMessage(message)) continue;
         const content = normalizeMessageContent(message.mes);
         if (!content) continue;
         const peerId = getPeerIdForChatMessage(message, index, honchoMeta);
@@ -538,6 +579,7 @@ function buildCurrentSyncEntries(honchoMeta) {
             content,
             hash: hashText(`${peerId}\n${content}`),
             name: message.name || (message.is_user ? getContext().name1 : getCharName()),
+            hidden: message.is_system === true,
         });
     }
     return entries;
@@ -554,6 +596,8 @@ function buildMessageMetadata(entry, version, status = {}) {
             st_peer_id: entry.peerId,
             st_role: entry.role,
             st_name: entry.name,
+            // Reflect ST Hide state for debugging only. Hidden messages stay current.
+            st_hidden: entry.hidden === true,
             current: status.current !== false,
             deleted: status.deleted === true,
             superseded: status.superseded === true,
@@ -854,7 +898,8 @@ async function onCharResponse(messageIndex) {
     const honchoMeta = chat_metadata?.honcho;
     if (!honchoMeta?.sessionId) return;
     const message = chat[messageIndex];
-    if (!message || message.is_user || message.is_system || messageIndex !== chat.length - 1) return;
+    // Hidden (is_system) character replies still sync; only real system/UI is skipped.
+    if (!message || message.is_user || isNonRoleplaySystemMessage(message) || messageIndex !== chat.length - 1) return;
 
     const peerId = getPeerIdForMessage(message);
     if (selected_group) {

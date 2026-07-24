@@ -86,6 +86,18 @@ Registra herramientas para modelos/backends compatibles con function calling:
 - Sesión por chat/personaje/custom según configuración.
 - Conclusiones explícitas guardadas por tool call.
 
+## Hide / mensajes ocultos
+
+En SillyTavern, **Hide** pone `is_system=true` para sacar el mensaje del presupuesto de contexto del modelo. Eso **no** borra el mensaje del chat.
+
+La extensión **ignora Hide** a propósito:
+
+- un mensaje oculto sigue sincronizándose y permanece vigente en Honcho;
+- Unhide no cambia el contenido en Honcho;
+- en RPs largos puedes ocultar turnos antiguos para ahorrar contexto del chat y Honcho sigue usándolos para memoria.
+
+Sí se excluyen mensajes de sistema/UI reales de SillyTavern (`extra.type` tipo help/welcome/slash help/tool calls, etc.). Los posts de narrador se tratan como contenido de roleplay.
+
 ## Sincronización con edición, borrado y regeneración
 
 SillyTavern permite editar, borrar y regenerar mensajes. Honcho API actual no borra ni edita contenido de mensajes por API pública; sólo permite actualizar metadata.
