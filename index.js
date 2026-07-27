@@ -208,6 +208,29 @@ function selectCurrentHonchoMessages(messages) {
     return Array.from(selected.values()).sort(compareHonchoMessagesBySTOrder);
 }
 
+/**
+ * Search/dialectic results from Honcho often lack honcho_st_sync metadata.
+ * Only drop explicitly tombstoned ST-synced rows; keep plain Honcho hits.
+ */
+function selectUsableMemoryHits(items) {
+    const out = [];
+    for (const item of items || []) {
+        if (typeof item === 'string') {
+            if (item.trim()) out.push({ content: item });
+            continue;
+        }
+        if (!item || typeof item !== 'object') continue;
+        const sync = getHonchoMetadata(item.metadata || item.h_metadata);
+        if (sync && Object.keys(sync).length) {
+            if (sync.deleted === true || sync.superseded === true || sync.current === false) continue;
+        }
+        const content = String(item.content || item.text || item.document || '').trim();
+        if (!content) continue;
+        out.push(item);
+    }
+    return out;
+}
+
 async function honchoRequest(method, path, { body = null, query = null, signal = null } = {}) {
     const baseUrl = getHonchoBaseUrl();
     if (!baseUrl) throw new Error('Honcho URL is required');
@@ -486,11 +509,11 @@ function formatSessionContext(context) {
 }
 
 function formatSemanticHits(results, limit = 6) {
-    const liveResults = selectCurrentHonchoMessages((results || []).filter(item => typeof item !== 'string'));
+    const liveResults = selectUsableMemoryHits(results || []);
     if (!liveResults.length) return null;
     const lines = liveResults.slice(0, limit).map((item, index) => {
         const content = String(item.content || item || '').replace(/\s+/g, ' ').trim().slice(0, 280);
-        const who = item.peer_id || item.peer_name || '';
+        const who = item.peer_id || item.peer_name || item.observer || item.observed || '';
         return `${index + 1}. ${who ? `${who}: ` : ''}${content}`;
     });
     return `Relevant memory hits:\n${lines.join('\n')}`;
@@ -1048,23 +1071,56 @@ function registerHonchoTools() {
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return 'Honcho session not initialized for this chat.';
 
-            // Dialectic first: curated answer from Honcho memory.
-            const dialectic = await honchoFetch('/chat', {
-                peerId: honchoMeta.userPeerId,
-                sessionId: honchoMeta.sessionId,
-                query: args.query,
-            }, 45000, `toolchat:${honchoMeta.sessionId}:${hashText(args.query).slice(0, 12)}`);
-            const answer = String(dialectic?.response || '').trim();
-            if (answer) return clampHonchoOutput(answer);
+            const rawQuery = String(args.query).trim();
+            // Huge omnibus prompts make dialectic slow/fragile; keep a focused head for the LLM call.
+            const dialecticQuery = rawQuery.length > 1200
+                ? `${rawQuery.slice(0, 1100)}\n\nAnswer with the most important durable facts only.`
+                : rawQuery;
 
-            // Fallback: compact semantic hits if dialectic is empty.
-            const search = await honchoFetch('/search', {
-                sessionId: honchoMeta.sessionId,
-                query: args.query,
-                limit: 6,
-            }, 30000, `toolsearch:${honchoMeta.sessionId}:${hashText(args.query).slice(0, 12)}`);
-            const hits = formatSemanticHits(search?.results || [], 6);
-            return hits ? clampHonchoOutput(hits) : 'No information available in Honcho memory for that query.';
+            // Dialectic first: curated answer from Honcho memory.
+            // Long identity dumps often need 60-90s on large sessions.
+            try {
+                const dialectic = await honchoFetch('/chat', {
+                    peerId: honchoMeta.userPeerId,
+                    sessionId: honchoMeta.sessionId,
+                    query: dialecticQuery,
+                }, 120000, `toolchat:${honchoMeta.sessionId}:${hashText(dialecticQuery).slice(0, 12)}`);
+                const answer = String(dialectic?.response || '').trim();
+                if (answer) return clampHonchoOutput(answer);
+            } catch (err) {
+                console.warn('[Honcho] dialectic tool query failed:', err?.message || err);
+            }
+
+            // Fallback 1: compact semantic hits (do NOT require ST sync metadata).
+            try {
+                const search = await honchoFetch('/search', {
+                    sessionId: honchoMeta.sessionId,
+                    query: rawQuery,
+                    limit: 8,
+                }, 45000, `toolsearch:${honchoMeta.sessionId}:${hashText(rawQuery).slice(0, 12)}`);
+                const hits = formatSemanticHits(search?.results || search || [], 8);
+                if (hits) return clampHonchoOutput(hits);
+            } catch (err) {
+                console.warn('[Honcho] search tool fallback failed:', err?.message || err);
+            }
+
+            // Fallback 2: shorter dialectic without waiting on the omnibus prompt.
+            try {
+                const shortQ = rawQuery.length > 240
+                    ? `${rawQuery.slice(0, 220)}. Summarize the key durable facts only.`
+                    : rawQuery;
+                const retry = await honchoFetch('/chat', {
+                    peerId: honchoMeta.userPeerId,
+                    sessionId: honchoMeta.sessionId,
+                    query: shortQ,
+                }, 90000, `toolchat-short:${honchoMeta.sessionId}:${hashText(shortQ).slice(0, 12)}`);
+                const answer = String(retry?.response || '').trim();
+                if (answer) return clampHonchoOutput(answer);
+            } catch (err) {
+                console.warn('[Honcho] short dialectic fallback failed:', err?.message || err);
+            }
+
+            return 'No information available in Honcho memory for that query.';
         },
         formatMessage: () => 'Querying Honcho memory...',
         shouldRegister,
@@ -1107,8 +1163,12 @@ function registerHonchoTools() {
             if (!args?.query) return 'No query provided.';
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId) return 'Honcho session not initialized for this chat.';
-            const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 6 });
-            const hits = formatSemanticHits(result?.results || [], 6);
+            const result = await honchoFetch('/search', {
+                sessionId: honchoMeta.sessionId,
+                query: args.query,
+                limit: 8,
+            }, 45000, `toolhist:${honchoMeta.sessionId}:${hashText(args.query).slice(0, 12)}`);
+            const hits = formatSemanticHits(result?.results || result || [], 8);
             return hits ? clampHonchoOutput(hits) : 'No matching memory hits found.';
         },
         formatMessage: () => 'Searching Honcho history...',
