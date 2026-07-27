@@ -379,13 +379,17 @@ async function callHonchoOperation(endpoint, body, signal) {
             return listed;
         }
         case '/context': {
+            const query = {
+                tokens: body.tokens,
+                summary: typeof body.summary === 'boolean' ? body.summary : undefined,
+            };
+            // Only attach peer perspective when explicitly requested.
+            if (body.userPeerId) {
+                query.peer_perspective = body.userPeerId;
+                query.peer_target = body.userPeerId;
+            }
             const context = await honchoRequest('GET', `/v3/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(body.sessionId)}/context`, {
-                query: {
-                    tokens: body.tokens,
-                    summary: typeof body.summary === 'boolean' ? body.summary : undefined,
-                    peer_perspective: body.userPeerId,
-                    peer_target: body.userPeerId,
-                },
+                query,
                 signal,
             });
             return { context: formatSessionContext(context) };
@@ -442,36 +446,143 @@ function buildSessionPeers(userPeerId, charPeerId, charPeerIds) {
     return peers;
 }
 
+function contextBudgetChars() {
+    return Math.max(400, Number(settings()?.contextTokens) || 2000) * 4;
+}
+
+function clampToBudget(text, budgetChars = contextBudgetChars(), label = 'Honcho context') {
+    if (typeof text !== 'string' || !text) return text || '';
+    if (text.length <= budgetChars) return text;
+    console.warn(`[Honcho] Truncating ${label}: ${text.length} chars → ${budgetChars} chars`);
+    return `${text.slice(0, Math.max(0, budgetChars - 80))}\n[Honcho truncated to ${settings()?.contextTokens || 2000} token budget]`;
+}
+
 function formatSessionContext(context) {
     if (!context) return null;
     const parts = [];
-    if (context.peer_representation) parts.push(context.peer_representation);
-    if (Array.isArray(context.peer_card) && context.peer_card.length) parts.push(context.peer_card.join('\n'));
-    if (context.summary?.content) parts.push(context.summary.content);
+    // Order: summary first (most useful for long RP), then card, then a short representation slice.
+    if (context.summary?.content) {
+        parts.push(`Session summary:\n${String(context.summary.content).trim()}`);
+    }
+    if (Array.isArray(context.peer_card) && context.peer_card.length) {
+        parts.push(`Peer card:\n${context.peer_card.map(item => `- ${item}`).join('\n')}`);
+    }
+    if (context.peer_representation) {
+        // Full representation can be huge; keep a compact head for prompt injection.
+        const rep = String(context.peer_representation).trim().replace(/\s+\n/g, '\n');
+        const compact = rep.length > 1800 ? `${rep.slice(0, 1800)}\n[peer representation truncated]` : rep;
+        parts.push(`Peer representation:\n${compact}`);
+    }
+    // Raw recent messages are last-resort only, and short.
     if (!parts.length && Array.isArray(context.messages) && context.messages.length) {
-        const recent = context.messages.slice(-8).map(message => `${message.peer_id || message.peer_name || 'peer'}: ${message.content}`);
-        parts.push(recent.join('\n'));
+        const recent = context.messages.slice(-4).map(message => {
+            const who = message.peer_id || message.peer_name || 'peer';
+            const content = String(message.content || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+            return `- ${who}: ${content}`;
+        });
+        parts.push(`Recent session snippets:\n${recent.join('\n')}`);
     }
     return parts.join('\n\n') || null;
 }
 
-function formatLiveMessageContext(messages) {
-    const liveMessages = selectCurrentHonchoMessages(messages);
-    if (!liveMessages.length) return null;
-    return liveMessages
-        .slice(-24)
-        .map(message => `${message.peer_id || message.peer_name || 'peer'}: ${message.content}`)
-        .join('\n');
+function formatSemanticHits(results, limit = 6) {
+    const liveResults = selectCurrentHonchoMessages((results || []).filter(item => typeof item !== 'string'));
+    if (!liveResults.length) return null;
+    const lines = liveResults.slice(0, limit).map((item, index) => {
+        const content = String(item.content || item || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+        const who = item.peer_id || item.peer_name || '';
+        return `${index + 1}. ${who ? `${who}: ` : ''}${content}`;
+    });
+    return `Relevant memory hits:\n${lines.join('\n')}`;
 }
 
-async function fetchCleanSessionContext(sessionId) {
-    const result = await honchoFetch('/session/list-messages', {
-        sessionId,
-        page: 1,
-        size: 100,
-        reverse: false,
-    });
-    return formatLiveMessageContext(result?.items || []);
+/**
+ * Context-only enrichment:
+ * - Prefer curated Honcho memory: representation / peer card / summary via /context
+ * - Optionally add compact semantic hits for the latest user turn
+ * - Never dump long raw chat history as the primary memory block
+ */
+async function fetchCuratedContext(honchoMeta, lastUserMessage = '') {
+    const parts = [];
+    const includeSummary = settings().contextSummary !== false;
+    const tokens = Math.max(100, Number(settings().contextTokens) || 2000);
+
+    // Prefer session-level context first (summary lives on the session).
+    // Peer perspective can omit summary depending on Honcho selection logic.
+    let contextResult = await honchoFetch('/context', {
+        sessionId: honchoMeta.sessionId,
+        tokens,
+        summary: includeSummary,
+    }, 30000, `ctxsess:${honchoMeta.sessionId}:${tokens}:${includeSummary ? 1 : 0}`);
+
+    if (contextResult?.context) parts.push(contextResult.context);
+
+    // If we still lack card/representation, try peer perspective once.
+    if (!contextResult?.context || !/Peer card:|Peer representation:|Session summary:/.test(contextResult.context)) {
+        const peerCtx = await honchoFetch('/context', {
+            sessionId: honchoMeta.sessionId,
+            userPeerId: honchoMeta.userPeerId,
+            tokens,
+            summary: includeSummary,
+        }, 30000, `ctxpeer:${honchoMeta.sessionId}:${honchoMeta.userPeerId}:${tokens}`);
+        if (peerCtx?.context && peerCtx.context !== contextResult?.context) {
+            parts.push(peerCtx.context);
+        }
+    }
+
+    // Semantic refinement around the latest user turn when available.
+    const query = String(lastUserMessage || '').trim();
+    if (query) {
+        const search = await honchoFetch(
+            '/search',
+            { sessionId: honchoMeta.sessionId, query: truncate(query, QUERY_CHAR_LIMIT, 'context search'), limit: 6 },
+            30000,
+            `ctxsearch:${honchoMeta.sessionId}:${hashText(query).slice(0, 12)}`,
+        );
+        const hits = formatSemanticHits(search?.results || [], 6);
+        if (hits) parts.push(hits);
+    }
+
+    // De-dupe crude repeats if both context calls returned similar blocks.
+    const unique = [];
+    for (const part of parts.filter(Boolean)) {
+        if (!unique.some(existing => existing === part || existing.includes(part) || part.includes(existing))) {
+            unique.push(part);
+        }
+    }
+    const joined = unique.join('\n\n').trim();
+    return joined ? clampToBudget(joined) : null;
+}
+
+/**
+ * Reasoning enrichment:
+ * Run the configured Reasoning queries through Honcho dialectic (/chat),
+ * not through raw message search.
+ */
+async function fetchReasoningAnswers(honchoMeta, lastUserMessage = '') {
+    const answers = [];
+    const queries = settings().prefetchQueries || [];
+    for (const query of queries) {
+        if (!isReady()) break;
+        const trimmed = String(query || '').trim().replace(/\{\{message\}\}/gi, lastUserMessage);
+        if (!trimmed) continue;
+        const result = await honchoFetch(
+            '/chat',
+            {
+                peerId: honchoMeta.userPeerId,
+                sessionId: honchoMeta.sessionId,
+                query: trimmed,
+            },
+            45000,
+            `reason:${honchoMeta.sessionId}:${hashText(trimmed).slice(0, 12)}`,
+        );
+        const answer = String(result?.response || '').trim();
+        if (answer) {
+            answers.push(`Q: ${trimmed}\nA: ${answer}`);
+        }
+    }
+    if (!answers.length) return null;
+    return clampToBudget(answers.join('\n\n'), contextBudgetChars(), 'Honcho reasoning');
 }
 
 function getUserPeerId() {
@@ -803,25 +914,10 @@ async function onChatChanged() {
     }
 }
 
-async function fetchReasoningQueries(honchoMeta, lastUserMessage) {
-    const results = [];
-    for (const query of settings().prefetchQueries || []) {
-        if (!isReady()) break;
-        const trimmed = query.trim().replace(/\{\{message\}\}/gi, lastUserMessage);
-        if (!trimmed) continue;
-        const result = await honchoFetchRawTracked('/search', { sessionId: honchoMeta.sessionId, query: trimmed, limit: 8 });
-        const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
-        if (liveResults.length) {
-            results.push(liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n'));
-        }
-    }
-    return results.length ? results.join('\n\n') : null;
-}
-
 async function onGeneration() {
     if (!isReady()) return;
     const honchoMeta = chat_metadata?.honcho;
-    if (!honchoMeta?.sessionId) return;
+    if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return;
 
     await reconcileHonchoMessages('before_generation');
 
@@ -837,44 +933,49 @@ async function onGeneration() {
         }
     }
 
+    const mode = settings().contextMode || 'context';
     const parts = [];
     try {
+        // Base layer for all modes: curated memory (summary/card/representation + optional semantic hits).
+        // Never dump long raw chat history here.
         turnsSinceLastContextRefresh++;
         if (cachedContextText === null) {
-            const contextResult = await fetchCleanSessionContext(honchoMeta.sessionId);
+            const contextResult = await fetchCuratedContext(honchoMeta, lastUserMessage);
             if (!isReady()) return;
             if (contextResult) cachedContextText = contextResult;
             turnsSinceLastContextRefresh = 0;
         } else if (turnsSinceLastContextRefresh >= (settings().contextInterval || 1) && !contextRefreshInFlight) {
             turnsSinceLastContextRefresh = 0;
             contextRefreshInFlight = true;
-            fetchCleanSessionContext(honchoMeta.sessionId)
+            fetchCuratedContext(honchoMeta, lastUserMessage)
                 .then(result => { if (isReady() && result) cachedContextText = result; })
                 .finally(() => { contextRefreshInFlight = false; });
         }
         if (cachedContextText) parts.push(cachedContextText);
 
-        if (settings().contextMode === 'reasoning') {
+        // Reasoning mode only: dialectic answers for configured queries.
+        // Tool-call mode intentionally does NOT run these; the chat model asks on demand.
+        if (mode === 'reasoning') {
             turnsSinceLastReasoning++;
             if (cachedReasoningText === null) {
-                const results = await fetchReasoningQueries(honchoMeta, lastUserMessage);
+                const results = await fetchReasoningAnswers(honchoMeta, lastUserMessage);
                 if (!isReady()) return;
                 if (results) cachedReasoningText = results;
                 turnsSinceLastReasoning = 0;
             } else if (turnsSinceLastReasoning >= (settings().prefetchInterval || 8) && !reasoningRefreshInFlight) {
                 turnsSinceLastReasoning = 0;
                 reasoningRefreshInFlight = true;
-                fetchReasoningQueries(honchoMeta, lastUserMessage)
+                fetchReasoningAnswers(honchoMeta, lastUserMessage)
                     .then(results => { if (isReady() && results) cachedReasoningText = results; })
                     .finally(() => { reasoningRefreshInFlight = false; });
             }
-            if (cachedReasoningText) parts.push(cachedReasoningText);
+            if (cachedReasoningText) parts.push(`Honcho reasoning:\n${cachedReasoningText}`);
         }
     } catch (err) {
         console.warn('[Honcho] Context injection error:', err.message);
     }
 
-    const contextText = parts.join('\n\n');
+    const contextText = parts.join('\n\n').trim();
     if (!contextText) {
         setExtensionPrompt(MODULE_NAME, '', extension_prompt_types.NONE, 0);
         return;
@@ -935,21 +1036,35 @@ function registerHonchoTools() {
     context.registerFunctionTool({
         name: 'honcho_query_memory',
         displayName: 'Honcho: Query Memory',
-        description: 'Query persistent Honcho memory about the user, preferences, history, personality traits, or relevant relationship context.',
+        description: 'Ask Honcho a natural-language question about long-term memory for this roleplay (who someone is, what happened somewhere, preferences, relationships, past events). Use this instead of guessing from current chat alone.',
         parameters: {
             $schema: 'http://json-schema.org/draft-04/schema#',
             type: 'object',
-            properties: { query: { type: 'string', description: 'Natural language question about memory.' } },
+            properties: { query: { type: 'string', description: 'Natural language question about memory. Examples: "Who is Eleonora?", "What happened in the ruins?", "What does Matei want?"' } },
             required: ['query'],
         },
         action: async (args) => {
             if (!args?.query) return 'No query provided.';
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId || !honchoMeta?.userPeerId) return 'Honcho session not initialized for this chat.';
-            const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 8 }, 30000, `tool:${honchoMeta.sessionId}:${args.query.slice(0, 40)}`);
-            const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
-            if (!liveResults.length) return 'No information available.';
-            return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
+
+            // Dialectic first: curated answer from Honcho memory.
+            const dialectic = await honchoFetch('/chat', {
+                peerId: honchoMeta.userPeerId,
+                sessionId: honchoMeta.sessionId,
+                query: args.query,
+            }, 45000, `toolchat:${honchoMeta.sessionId}:${hashText(args.query).slice(0, 12)}`);
+            const answer = String(dialectic?.response || '').trim();
+            if (answer) return clampHonchoOutput(answer);
+
+            // Fallback: compact semantic hits if dialectic is empty.
+            const search = await honchoFetch('/search', {
+                sessionId: honchoMeta.sessionId,
+                query: args.query,
+                limit: 6,
+            }, 30000, `toolsearch:${honchoMeta.sessionId}:${hashText(args.query).slice(0, 12)}`);
+            const hits = formatSemanticHits(search?.results || [], 6);
+            return hits ? clampHonchoOutput(hits) : 'No information available in Honcho memory for that query.';
         },
         formatMessage: () => 'Querying Honcho memory...',
         shouldRegister,
@@ -959,7 +1074,7 @@ function registerHonchoTools() {
     context.registerFunctionTool({
         name: 'honcho_save_conclusion',
         displayName: 'Honcho: Save Conclusion',
-        description: 'Save an important conclusion, insight, or fact about the user to persistent Honcho memory.',
+        description: 'Save an important conclusion, insight, or fact about the user/character to persistent Honcho memory.',
         parameters: {
             $schema: 'http://json-schema.org/draft-04/schema#',
             type: 'object',
@@ -981,23 +1096,22 @@ function registerHonchoTools() {
     context.registerFunctionTool({
         name: 'honcho_search_history',
         displayName: 'Honcho: Search History',
-        description: 'Search past conversation messages stored in Honcho. Requires Honcho search/embeddings to be configured.',
+        description: 'Semantic search over stored conversation/memory in Honcho for this session. Prefer honcho_query_memory for open questions; use this for finding specific past details.',
         parameters: {
             $schema: 'http://json-schema.org/draft-04/schema#',
             type: 'object',
-            properties: { query: { type: 'string', description: 'What to search in conversation history.' } },
+            properties: { query: { type: 'string', description: 'What to search in conversation/memory history.' } },
             required: ['query'],
         },
         action: async (args) => {
             if (!args?.query) return 'No query provided.';
             const honchoMeta = chat_metadata?.honcho;
             if (!honchoMeta?.sessionId) return 'Honcho session not initialized for this chat.';
-            const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 5 });
-            const liveResults = selectCurrentHonchoMessages((result?.results || []).filter(item => typeof item !== 'string'));
-            if (!liveResults.length) return 'No matching messages found.';
-            return liveResults.map((item, index) => `${index + 1}. ${item.content || item}`).join('\n');
+            const result = await honchoFetch('/search', { sessionId: honchoMeta.sessionId, query: args.query, limit: 6 });
+            const hits = formatSemanticHits(result?.results || [], 6);
+            return hits ? clampHonchoOutput(hits) : 'No matching memory hits found.';
         },
-        formatMessage: () => 'Searching conversation history...',
+        formatMessage: () => 'Searching Honcho history...',
         shouldRegister,
         stealth: false,
     });

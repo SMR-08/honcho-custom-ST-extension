@@ -128,27 +128,28 @@
                     <label>
                         <input type="radio" name="honcho_context_mode" value="context" />
                         <span>Context only</span>
-                        <i class="fa-solid fa-info-circle" title="Peer representation and session summary only."></i>
+                        <i class="fa-solid fa-info-circle" title="Curated memory only: session summary, peer card/representation, plus compact semantic hits for the latest user turn. No long raw chat dumps."></i>
                     </label>
                     <label>
                         <input type="radio" name="honcho_context_mode" value="reasoning" />
                         <span>Reasoning</span>
-                        <i class="fa-solid fa-info-circle" title="Context + dialectic reasoning queries on an interval."></i>
+                        <i class="fa-solid fa-info-circle" title="Context plus Honcho dialectic answers for each configured Reasoning query. Uses /peers/{peer}/chat, not raw message dumps."></i>
                     </label>
                     <label>
                         <input type="radio" name="honcho_context_mode" value="tool_call" />
                         <span>Tool call</span>
-                        <i class="fa-solid fa-info-circle" title="Context + function tools the LLM can call on demand."></i>
+                        <i class="fa-solid fa-info-circle" title="Context only auto-injected. The chat model may call Honcho tools on demand (who is X? what happened at Y?). Reasoning queries are NOT auto-run."></i>
                     </label>
                 </div>
 
                 <!-- Reasoning settings (shown when reasoning mode) -->
                 <div id="honcho_prefetch_section" class="honcho_section">
                     <label for="honcho_prefetch_queries">Reasoning queries (one per line)</label>
-                    <textarea id="honcho_prefetch_queries" class="text_pole textarea_compact" rows="3" placeholder="Use {{message}} for the user's last message&#10;e.g. Based on: &quot;{{message}}&quot;, what's relevant about the user?"></textarea>
+                    <textarea id="honcho_prefetch_queries" class="text_pole textarea_compact" rows="3" placeholder="Use {{message}} for the user's last message&#10;e.g. Based on: &quot;{{message}}&quot;, what long-term facts matter?"></textarea>
+                    <span class="honcho_field_hint" style="font-size: 0.8em; opacity: 0.6;">Only used in Reasoning mode. Each line is asked to Honcho dialectic. Tool call mode ignores these and lets the chat model ask its own questions.</span>
                     <label for="honcho_prefetch_interval">Reason every N turns</label>
                     <input id="honcho_prefetch_interval" type="number" class="text_pole" min="1" max="100" value="8" />
-                    <i class="fa-solid fa-info-circle" style="opacity: 0.6; font-size: 0.85em;" title="Always runs on session start. Cached results served instantly between refreshes."></i>
+                    <i class="fa-solid fa-info-circle" style="opacity: 0.6; font-size: 0.85em;" title="Always runs on session start / first need. Cached results served between refreshes."></i>
                 </div>
 
                 <hr />

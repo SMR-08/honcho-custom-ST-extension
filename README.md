@@ -62,21 +62,35 @@ La configuración se guarda en `extension_settings.honcho` dentro de SillyTavern
 
 ### Context only
 
-Recupera contexto de Honcho y lo inyecta en el prompt de SillyTavern.
+Inyecta memoria **curtida** de Honcho:
+
+- session summary (si está activado),
+- peer representation / peer card,
+- hits semánticos compactos del último mensaje del usuario.
+
+No vuelca historial crudo del chat como bloque principal. Respeta el budget de `contextTokens`.
 
 ### Reasoning
 
-Además del contexto base, ejecuta queries periódicas contra Honcho dialectic chat. Las queries se configuran en el panel y pueden usar `{{message}}` para insertar el último mensaje del usuario.
+Todo lo de Context only, **más** respuestas de Honcho dialectic (`POST /v3/workspaces/{ws}/peers/{peer}/chat`) para cada línea de **Reasoning queries**.
+
+- Usa `{{message}}` para insertar el último mensaje del usuario.
+- Corre al inicio / cada N turns y se cachea.
+- Esto **sí** es “Honcho razona y contesta”.
 
 ### Tool call
 
-Registra herramientas para modelos/backends compatibles con function calling:
+Auto-inyecta solo Context only.
 
-- `honcho_query_memory`
-- `honcho_save_conclusion`
-- `honcho_search_history`
+**No** ejecuta Reasoning queries automáticamente.
 
-`honcho_search_history` requiere que Honcho tenga búsqueda/embeddings configurados.
+El modelo del chat de SillyTavern puede llamar tools cuando quiera:
+
+- `honcho_query_memory` → pregunta natural a dialectic (ej. “¿quién es X?”, “¿qué pasó en Y?”)
+- `honcho_search_history` → búsqueda semántica compacta
+- `honcho_save_conclusion` → guardar un hecho importante
+
+Requiere function calling activo en el backend/modelo de ST.
 
 ## Datos que guarda en Honcho
 
